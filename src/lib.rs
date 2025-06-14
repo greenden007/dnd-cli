@@ -136,7 +136,7 @@ pub async fn push_load() -> Result<(), anyhow::Error> {
                 }
             }))
         }
-    }
+    } // Test run
 
     Ok(())
 }

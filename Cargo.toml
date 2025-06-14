@@ -1,0 +1,49 @@
+[package]
+name = "archerdndsys"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.87.0"
+description = "A command-line tool for managing and querying dnd content, fully homebrewable."
+authors = ["Lockie <gameracer007@gmail.com>"]
+
+[[bin]]
+name = "archerdndsys"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.39", features = ["derive", "color", "suggestions"] }
+reqwest = { version = "0.12.19", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.29.0"
+
+config = "0.15.11"
+dirs = "6.0.0"
+
+anyhow = "1.0"
+thiserror = "1.0"
+indicatif = "0.17"
+
+chrono = { version = "0.4", features = ["serde"] }
+
+url = "2.4"
+signal-hook = "0.3.18"
+crossterm = "0.29.0"
+futures = "0.3.31"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1.7.0"
+tempfile = "3.20.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

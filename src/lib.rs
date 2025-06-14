@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use crossterm::style::Stylize;
-use futures::future::join_all;
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
@@ -140,4 +139,3 @@ pub async fn push_load() -> Result<(), anyhow::Error> {
 
     Ok(())
 }
-

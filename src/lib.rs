@@ -1,3 +1,4 @@
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use crossterm::style::Stylize;
 use reqwest::Client;
@@ -7,14 +8,37 @@ pub mod auth;
 pub mod ui;
 pub mod client;
 
-static LOCAL_ID: i32 = 0; // This is a placeholder for local ID management, can be used to track unsynced items
+pub static LOCAL_ID: u32 = 0; // This is a placeholder for local ID management, can be used to track unsynced items
+pub static mut CACHE: BinaryHeap<String> = BinaryHeap::new(); // This will be used to cache the local items
+
+pub fn error_string(msg: &str) -> String {
+    format!("{}: {}", "[ERROR]".red(), msg)
+}
+
+pub fn info_string(msg: &str) -> String {
+    format!("{}: {}", "[INFO]".green(), msg)
+}
+
+pub fn warning_string(msg: &str) -> String {
+    format!("{}: {}", "[WARN]".yellow(), msg)
+}
+
+pub fn debug_string(msg: &str) -> String {
+    format!("{}: {}", "[DEBUG]".cyan(), msg)
+}
+
+pub fn trace_string(msg: &str) -> String {
+    format!("{}: {}", "[TRACE]".grey(), msg)
+}
+
+pub const setup_string: &str = "Please run `archerdndsys setup` to initialize the client.";
 
 pub const SERVER: &str = "https://archerdnd.tech/api";
 pub const REQ_FILES: [&str; 18] = [
     "saved_objs/",
     ".auth_tokens.txt",
-    ".session_id.txt",
     ".auto_login.txt",
+    "synced.txt",
     "saved_objs/Characters/",
     "saved_objs/Classes/",
     "saved_objs/Features/",
@@ -41,7 +65,7 @@ pub fn check_setup_cmpl() -> Result<(), clap::Error> {
     if !archerdndsys_dir.exists() {
         return Err(clap::Error::raw(
             clap::error::ErrorKind::Io,
-            "Please run `archerdndsys --setup` to initialize the client.",
+            setup_string,
         ));
     }
 
@@ -50,7 +74,7 @@ pub fn check_setup_cmpl() -> Result<(), clap::Error> {
         if !file_path.exists() {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::Io,
-                format!("Required file '{}' not found. Please run `archerdndsys --setup` to initialize the client.", file),
+                format!("Required file '{}' not found. {}", file, setup_string),
             ));
         }
     }
@@ -135,6 +159,38 @@ pub async fn push_load() -> Result<(), anyhow::Error> {
                 }
             }))
         }
+    }
+
+    Ok(())
+}
+
+pub unsafe fn ready_cache() -> Result<(), anyhow::Error> {
+    let home_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let sync_file_path = home_dir.join(".archerdndsys").join("saved_objs").join("synced.txt");
+    if !sync_file_path.exists() {
+        return Err(anyhow::anyhow!("Synced file not found. Please run `archerdndsys --setup` to initialize the client."));
+    }
+
+    // Load the cache from the synced file
+    let synced_data = std::fs::read_to_string(sync_file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read synced file: {}", e))?;
+
+    let mut synced_items: Vec<String> = synced_data.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    synced_items.remove(0);
+
+    for item in synced_items.iter() {
+        CACHE.push(item.clone());
     }
 
     Ok(())

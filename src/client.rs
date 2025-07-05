@@ -1,4 +1,4 @@
-use crate::check_setup_cmpl;
+use crate::{check_setup_cmpl, error_string, info_string, warning_string, debug_string, trace_string, setup_string};
 use crossterm::style::Stylize;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
@@ -126,7 +126,7 @@ pub fn clean_session_calls(session_calls: PathBuf) -> Result<(), anyhow::Error> 
 pub fn collect_session_calls(fp: PathBuf) -> Result<Vec<Vec<String>>, anyhow::Error> {
     let session_calls_path = fp;
     if !session_calls_path.exists() && !session_calls_path.is_file() {
-        return Err(anyhow::anyhow!("[ERROR] Session calls file does not exist: {}", session_calls_path.display()));
+        return Err(anyhow::anyhow!("{}", error_string(&format!("Session calls file does not exist: {}", session_calls_path.display()))));
     }
     // Read file line by line
     let contents = fs::read_to_string(&session_calls_path)?;
@@ -138,7 +138,7 @@ pub fn collect_session_calls(fp: PathBuf) -> Result<Vec<Vec<String>>, anyhow::Er
             if parts.len() >= 2 {
                 calls.push(parts);
             } else {
-                return Err(anyhow::anyhow!("[ERROR] Invalid session call format: {}", line));
+                return Err(anyhow::anyhow!("{}", error_string(&format!("Invalid session call format: {}", line))));
             }
         }
     }
@@ -154,7 +154,7 @@ pub async fn calculate_cache_size() -> Result<(u64), anyhow::Error> {
     let saved_objs_dir = archerdndsys_dir.join("saved_objs");
     
     if !saved_objs_dir.exists() {
-        return Err(anyhow::anyhow!("[ERROR] Saved objects directory does not exist: {}", saved_objs_dir.display()));
+        return Err(anyhow::anyhow!("{}", error_string(&format!("Saved objects directory does not exist: {}", saved_objs_dir.display()))));
     }
     
     let mut total_size = 0;
@@ -167,7 +167,7 @@ pub async fn calculate_cache_size() -> Result<(u64), anyhow::Error> {
                     let sub_entry = sub_entry?;
                     if sub_entry.file_type()?.is_file() {
                         total_size += sub_entry.metadata()?.len();
-                        println!("[INFO] {} {}: {} bytes", "Found file:".green(), sub_entry.path().display().to_string().bold(), sub_entry.metadata()?.len());
+                        println!("{}", trace_string(&format!("Found file: {}: {} bytes", sub_entry.path().display().to_string().bold(), sub_entry.metadata()?.len())));
                     }
                 }
             }
@@ -188,7 +188,7 @@ pub async fn clear_cache(days: u64) -> Result<(), anyhow::Error> {
     let saved_objs_dir = archerdndsys_dir.join("saved_objs");
 
     if !saved_objs_dir.exists() {
-        return Err(anyhow::anyhow!("[ERROR] {} {}", "Saved objects directory does not exist:".red(), saved_objs_dir.display().to_string().bold()));
+        return Err(anyhow::anyhow!("{}", error_string(&format!("Saved objects directory does not exist: {}", saved_objs_dir.display().to_string().bold()))));
     }
 
     let cutoff_time = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);
@@ -199,7 +199,7 @@ pub async fn clear_cache(days: u64) -> Result<(), anyhow::Error> {
         if dir.file_type()?.is_file() {
             let path = dir.path();
             fs::remove_file(&path)?;
-            println!("[INFO] {} {}", "Deleted file:".green(), path.display().to_string().bold());
+            println!("{}", info_string(&format!("Deleted file: {}", path.display().to_string().bold())));
             continue;
         }
         for entry in fs::read_dir(dir.path())? {
@@ -214,9 +214,9 @@ pub async fn clear_cache(days: u64) -> Result<(), anyhow::Error> {
                 let path = entry.path();
                 if path.is_file() {
                     fs::remove_file(&path)?;
-                    println!("[INFO] {} {}", "Deleted file:".green(), path.display().to_string().bold());
+                    println!("{}", info_string(&format!("Deleted file: {}", path.display().to_string().bold())));
                 } else if path.is_dir() {
-                    println!("[ERROR] {} {}", "Unexpected directory in saved_objs:".red(), path.display().to_string().bold());
+                    println!("{}", warning_string(&format!("Unexpected directory in saved_objs: {}", path.display().to_string().bold())));
                 }
             }
         }
@@ -234,7 +234,7 @@ pub async fn clear_all_cache() -> Result<(), anyhow::Error> {
     let saved_objs_dir = archerdndsys_dir.join("saved_objs");
     
     if !saved_objs_dir.exists() {
-        return Err(anyhow::anyhow!("[ERROR] {} {}", "Saved objects directory does not exist:".red(), saved_objs_dir.display().to_string().bold()));
+        return Err(anyhow::anyhow!("{}", error_string(&format!("Saved objects directory does not exist: {}", saved_objs_dir.display().to_string().bold()))));
     }
     
     for dir in fs::read_dir(saved_objs_dir)? {
@@ -242,7 +242,7 @@ pub async fn clear_all_cache() -> Result<(), anyhow::Error> {
         if !dir.file_type()?.is_dir() {
             let path = dir.path();
             fs::remove_file(&path)?;
-            println!("[INFO] {} {}", "Deleted file:".green(), path.display().to_string().bold());
+            println!("{}", info_string(&format!("Deleted file: {}", path.display().to_string().bold())));
         }
         let dir_path = dir.path();
         for entry in fs::read_dir(dir_path)? {
@@ -253,7 +253,7 @@ pub async fn clear_all_cache() -> Result<(), anyhow::Error> {
                 println!("[INFO] {} {}", "Deleted file:".green(), path.display().to_string().bold());
             } else if path.is_dir() {
                 fs::remove_dir_all(&path)?;
-                println!("[INFO] {} {}", "Deleted directory:".green(), path.display().to_string().bold());
+                println!("{}", info_string(&format!("Deleted directory: {}", path.display().to_string().bold())));
             }
         }
     }
@@ -269,7 +269,7 @@ pub async fn load_auth_tokens() -> Result<(String, String), anyhow::Error> {
 
 
     if !auth_tokens_path.exists() {
-        return Err(anyhow::anyhow!("[ERROR] Authorization tokens file not found. Please run `archerdndsys --setup` to initialize the client."));
+        return Err(anyhow::anyhow!("{} {} {}", error_string(""), "Auth tokens file does not exist. ", setup_string));
     }
 
     let contents = fs::read_to_string(auth_tokens_path)?;
@@ -288,7 +288,7 @@ pub async fn load_auth_tokens() -> Result<(String, String), anyhow::Error> {
 
 pub async fn process_call(call: Vec<String>, client: Arc<Client>, authTokens: (String, String)) -> Result<(), anyhow::Error> {
     if call.len() < 2 {
-        return Err(anyhow::anyhow!("[ERROR] Invalid session call format: {:?}", call));
+        return Err(anyhow::anyhow!("{}", error_string(&format!("Invalid session call format: {:?}", call))));
     }
 
     let method = call[0].clone();
@@ -303,9 +303,9 @@ pub async fn process_call(call: Vec<String>, client: Arc<Client>, authTokens: (S
                 .send()
                 .await?;
             if response.status().is_success() {
-                println!("{} {} {}", "[INFO] POST request to".green(), endpoint.bold(), "succeeded.".green());
+                println!("{}", debug_string(&format!("POST request to {} succeeded.", endpoint.bold())));
             } else {
-                println!("{} {} {} {}", "[ERROR] POST request to".red(), endpoint.bold(), "failed with status:".red(), response.status());
+                println!("{}", error_string(&format!("POST request to {} failed with status: {}", endpoint.bold(), response.status())));
             }
         },
         "PUT" => {
@@ -316,9 +316,9 @@ pub async fn process_call(call: Vec<String>, client: Arc<Client>, authTokens: (S
                 .send()
                 .await?;
             if response.status().is_success() {
-                println!("[INFO] PUT request to {} succeeded.", endpoint);
+                println!("{}", debug_string(&format!("PUT request to {} succeeded.", endpoint)));
             } else {
-                println!("[ERROR] PUT request to {} failed with status: {}", endpoint, response.status());
+                println!("{}", error_string(&format!("PUT request to {} failed with status: {}", endpoint, response.status())));
             }
         },
         "DELETE" => {
@@ -327,15 +327,15 @@ pub async fn process_call(call: Vec<String>, client: Arc<Client>, authTokens: (S
                 .send()
                 .await?;
             if response.status().is_success() {
-                println!("[INFO] DELETE request to {} succeeded.", endpoint);
+                println!("{}", debug_string(&format!("DELETE request to {} succeeded.", endpoint)));
             } else {
-                println!("[ERROR] DELETE request to {} failed with status: {}", endpoint, response.status());
+                println!("{}", error_string(&format!("DELETE request to {} failed with status: {}", endpoint, response.status())));
             }
         },
-        _ => return Err(anyhow::anyhow!("[ERROR] Unsupported HTTP method: {}", method))
+        _ => return Err(anyhow::anyhow!("{}", error_string(&format!("Unsupported HTTP method: {}", method))))
     }
 
     Ok(())
 }
 
-// All Campaign Commands can be made directly to the server; rate limit to 15 per minute.
+// All Campaign Commands can be made directly to the server; rate limit to 30 per minute.

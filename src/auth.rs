@@ -1,5 +1,5 @@
 use crossterm::style::Stylize;
-use crate::{SERVER, check_setup_cmpl};
+use crate::{SERVER, check_setup_cmpl, error_string, info_string, warning_string, debug_string, trace_string, setup_string};
 
 async fn base_login(username: &str, password: &str) -> Result<(String, String), anyhow::Error> {
     let client = reqwest::Client::new();
@@ -33,8 +33,13 @@ async fn base_login(username: &str, password: &str) -> Result<(String, String), 
         std::fs::write(auth_file_path, auth_data)
             .map_err(|e| anyhow::anyhow!("Failed to save auth token: {}", e))?;
 
-        println!("{}", "[INFO] Login successful. Auth token saved.".green());
-        println!("{}", "[INFO] Save info for auto login? (y/n)".yellow());
+        let synced_file_path = home_dir.join(".archerdndsys/synced.txt");
+        let token_form = format!("{}\n", token);
+        std::fs::write(synced_file_path, token_form)
+            .map_err(|e| anyhow::anyhow!("Failed to save synced file: {}", e))?;
+
+        println!("{}", info_string("Login successful. Auth token saved."));
+        println!("{}", warning_string("Save info for auto login? (y/n)"));
 
         // Save auto login info
         let mut auto_login_choice = String::new();
@@ -45,17 +50,17 @@ async fn base_login(username: &str, password: &str) -> Result<(String, String), 
             let auto_login_fp = home_dir.join(".archerdndsys/.auto_login.txt");
             std::fs::write(auto_login_fp, auto_login_data)
                 .map_err(|e| anyhow::anyhow!("Failed to save auto login token: {}", e))?;
-            println!("{}", "[INFO] Auto login info saved.".green());
-        } else {
-            println!("{}", "[INFO] Auto login info not saved. Try again later.".yellow());
+            println!("{}", info_string("Auto login info saved."));
+                    } else {
+            println!("{}", warning_string("Auto login info not saved. Try again later."));
         }
 
         // Return the token and user id
         Ok((token, user_id))
     } else {
         let error_text = response.text().await?;
-        println!("{}", "[ERROR] Login failed.".red());
-        println!("{} {}", "[ERROR] Response: ".red(), error_text);
+        println!("{}", error_string("Login failed."));
+        println!("{}", error_string(&format!("Response: {}", error_text)));
         Err(anyhow::anyhow!("Login failed: {}", error_text))
     }
 }
@@ -71,32 +76,32 @@ pub async fn auto_login() -> Result<(String, String), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("Failed to read auth token file: {}", e))?;
 
     if !auth_data.contains(',') {
-        println!("{}", "[ERROR] Invalid auth token format.".red());
+        println!("{}", error_string("Invalid auth token format."));
         return Err(anyhow::anyhow!("Invalid auth token format."));
     }
 
     let parts: Vec<&str> = auth_data.trim().split(',').collect();
     if parts.len() != 2 {
-        println!("{}", "[ERROR] Invalid auth token format.".red());
+        println!("{}", error_string("Invalid auth token format."));
         return Err(anyhow::anyhow!("Invalid auth token format."));
     }
 
-    println!("{}", "[INFO] Auto login found. Logging in...".green());
+    println!("{}", info_string("Auto login found. Logging in..."));
     base_login(&parts[0], &parts[1]).await
 }
 
 pub async fn manual_login() -> Result<(String, String), anyhow::Error> {
     check_setup_cmpl()?;
-    println!("{}", "[INFO] Please enter your username and password to login.".yellow());
+    println!("{}", warning_string("Please enter your username and password to login."));
 
     let mut username = String::new();
     let mut password = String::new();
 
-    println!("{}", "[INFO] Enter username: ".yellow());
+    println!("{}", warning_string("Enter username:"));
     std::io::stdin().read_line(&mut username).expect("Failed to read username");
     username = username.trim().to_string();
 
-    println!("{}", "[INFO] Enter password: ".yellow());
+    println!("{}", warning_string("Enter password:"));
     std::io::stdin().read_line(&mut password).expect("Failed to read password");
     password = password.trim().to_string();
 
@@ -108,14 +113,14 @@ pub async fn register() -> Result<(String, String), anyhow::Error> {
     let mut email = String::new();
     let mut password = String::new();
 
-    println!("{}", "[INFO] Please enter your username, email, and password to register.".yellow());
-    print!("{}", "[INFO] Enter username: ".yellow());
+    println!("{}", warning_string("Please enter your username, email, and password to register."));
+    print!("{}", warning_string("Enter username:"));
     std::io::stdin().read_line(&mut username).expect("Failed to read username");
     username = username.trim().to_string();
-    print!("{}", "[INFO] Enter email: ".yellow());
+    print!("{}", warning_string("Enter email:"));
     std::io::stdin().read_line(&mut email).expect("Failed to read email");
     email = email.trim().to_string();
-    print!("{}", "[INFO] Enter password: ".yellow());
+    print!("{}", warning_string("Enter password:"));
     std::io::stdin().read_line(&mut password).expect("Failed to read password");
     password = password.trim().to_string();
 
@@ -148,9 +153,15 @@ pub async fn register() -> Result<(String, String), anyhow::Error> {
         let auth_data = format!("{},{}", token, user_id);
         std::fs::write(auth_file_path, auth_data)
             .map_err(|e| anyhow::anyhow!("Failed to save auth token: {}", e))?;
-        println!("{}", "[INFO] Registration successful. Auth token saved.".green());
 
-        println!("{}", "[INFO] Save info for auto login?".yellow());
+        let synced_file_path = home_dir.join(".archerdndsys/synced.txt");
+        let token_form = format!("{}\n", token);
+        std::fs::write(synced_file_path, token_form)
+            .map_err(|e| anyhow::anyhow!("Failed to save synced file: {}", e))?;
+
+        println!("{}", info_string("Registration successful. Auth token saved."));
+
+        println!("{}", warning_string("Save info for auto login?"));
         // Save auto login info
         let mut auto_login_choice = String::new();
         std::io::stdin().read_line(&mut auto_login_choice).expect("Failed to read input");
@@ -160,17 +171,17 @@ pub async fn register() -> Result<(String, String), anyhow::Error> {
             let auto_login_fp = home_dir.join(".archerdndsys/.auto_login.txt");
             std::fs::write(auto_login_fp, auto_login_data)
                 .map_err(|e| anyhow::anyhow!("Failed to save auto login token: {}", e))?;
-            println!("{}", "[INFO] Auto login info saved.".green());
-        } else {
-            println!("{}", "[INFO] Auto login info not saved. Try again later.".yellow());
+            println!("{}", info_string("Auto login info saved."));
+                    } else {
+            println!("{}", warning_string("Auto login info not saved. Try again later."));
         }
 
         // Return the token and user id
         Ok((token, user_id))
     } else {
         let error_text = response.text().await?;
-        println!("{}", "[ERROR] Registration failed.".red());
-        println!("{} {}", "[ERROR] Response: ".red(), error_text);
+        println!("{}", error_string("Registration failed."));
+        println!("{}", error_string(&format!("Response: {}", error_text)));
         Err(anyhow::anyhow!("Registration failed: {}", error_text))
     }
 }
@@ -181,27 +192,27 @@ pub async fn logout() -> Result<(), anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
     let auth_file_path = home_dir.join(".archerdndsys/.auth_tokens.txt");
 
-    println!("{}", "[INFO] Logging out...".yellow());
+    println!("{}", warning_string("Logging out..."));
     // Send logout request to server
     let client = reqwest::Client::new();
     let response = client.post(format!("{}/auth/logout", SERVER))
         .send()
         .await?;
     if response.status().is_success() {
-        println!("{}", "[INFO] Logout request sent successfully.".green());
+        println!("{}", info_string("Logout request sent successfully."));
     } else {
         let error_text = response.text().await?;
-        println!("{}", "[ERROR] Logout failed.".red());
-        println!("{} {}", "[ERROR] Response: ".red(), error_text);
+        println!("{}", error_string("Logout failed."));
+        println!("{}", error_string(&format!("Response: {}", error_text)));
         return Err(anyhow::anyhow!("Logout failed: {}", error_text));
     }
 
     if auth_file_path.exists() {
         std::fs::remove_file(auth_file_path)
             .map_err(|e| anyhow::anyhow!("Failed to remove auth token file: {}", e))?;
-        println!("{}", "[INFO] Logout successful. Auth token removed.".green());
-    } else {
-        println!("{}", "[INFO] No auth token found. Already logged out.".yellow());
+        println!("{}", info_string("Logout successful. Auth token removed."));
+            } else {
+        println!("{}", warning_string("No auth token found. Already logged out."));
     }
 
     Ok(())
@@ -209,7 +220,7 @@ pub async fn logout() -> Result<(), anyhow::Error> {
 
 pub async fn is_signed_in() -> bool {
     let home_dir = dirs::home_dir().unwrap_or_else(|| {
-        println!("{}", "[ERROR] Could not find home directory.".red());
+        println!("{}", error_string("Could not find home directory."));
         std::process::exit(1);
     });
     let auth_file_path = home_dir.join(".archerdndsys/.auth_tokens.txt");
@@ -230,27 +241,51 @@ pub async fn is_signed_in() -> bool {
                             .send()
                             .await;
                         if response.unwrap().status().is_success() {
-                            println!("{}", "[INFO] User is signed in.".green());
+                            println!("{}", info_string("User is signed in."));
                             true
                         } else {
-                            println!("{}", "[ERROR] User is not signed in.".red());
+                            println!("{}", warning_string("User is not signed in."));
                             false
                         }
-                    } else {
-                        println!("{}", "[ERROR] Invalid auth token format.".red());
+                                            } else {
+                        println!("{}", warning_string("Invalid auth token format."));
                         false
-                    }
-                } else {
-                    println!("{}", "[ERROR] Invalid auth token format.".red());
-                    false
-                }
-            },
-            Err(e) => {
-                println!("{} {}", "[ERROR] Failed to read auth token file:".red(), e);
+                                            }
+                                        } else {
+                                            println!("{}", warning_string("Invalid auth token format."));
+                                            false
+                                        }
+                                    },
+                                    Err(e) => {
+                                        println!("{}", error_string(&format!("Failed to read auth token file: {}", e)));
                 false
             }
         }
     } else {
         false
     }
+}
+
+pub fn read_auth_tokens() -> Result<(String, String), anyhow::Error> {
+    let home_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let auth_tokens_path = home_dir.join(".archerdndsys/.auth_tokens.txt");
+    
+    if !auth_tokens_path.exists() {
+        return Err(anyhow::anyhow!("Authorization tokens file not found. {}", setup_string));
+    }
+
+    let auth_data = std::fs::read_to_string(auth_tokens_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read auth tokens: {}", e))?;
+
+    if !auth_data.contains(',') {
+        return Err(anyhow::anyhow!("Invalid auth token format."));
+    }
+
+    let parts: Vec<&str> = auth_data.trim().split(',').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("Invalid auth token format."));
+    }
+
+    Ok((parts[0].to_string(), parts[1].to_string()))
 }

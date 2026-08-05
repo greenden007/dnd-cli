@@ -3,7 +3,8 @@ use crossterm::style::Stylize;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
 use futures::future::join_all;
-use reqwest::Client;
+use crate::transport::ApiClient;
+use crate::config::data_dir;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -134,7 +135,7 @@ pub fn collect_session_calls(fp: PathBuf) -> Result<Vec<Vec<String>>, anyhow::Er
     for line in contents.lines() {
         let line = line.trim();
         if !line.is_empty() {
-            let parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+            let parts: Vec<String> = line.splitn(3, ' ').map(|s| s.trim().to_string()).collect();
             if parts.len() >= 2 {
                 calls.push(parts);
             } else {
@@ -147,11 +148,7 @@ pub fn collect_session_calls(fp: PathBuf) -> Result<Vec<Vec<String>>, anyhow::Er
 }
 
 pub async fn calculate_cache_size() -> Result<(u64), anyhow::Error> {
-    let home_dir = dirs::home_dir().ok_or_else(|| {
-        anyhow::anyhow!("Could not find home directory")
-    })?;
-    let archerdndsys_dir = home_dir.join(".archerdndsys");
-    let saved_objs_dir = archerdndsys_dir.join("saved_objs");
+    let saved_objs_dir = data_dir()?.join("saved_objs");
     
     if !saved_objs_dir.exists() {
         return Err(anyhow::anyhow!("{}", error_string(&format!("Saved objects directory does not exist: {}", saved_objs_dir.display()))));
@@ -181,11 +178,7 @@ pub async fn calculate_cache_size() -> Result<(u64), anyhow::Error> {
 }
 
 pub async fn clear_cache(days: u64) -> Result<(), anyhow::Error> {
-    let home_dir = dirs::home_dir().ok_or_else(|| {
-        anyhow::anyhow!("Could not find home directory")
-    })?;
-    let archerdndsys_dir = home_dir.join(".archerdndsys");
-    let saved_objs_dir = archerdndsys_dir.join("saved_objs");
+    let saved_objs_dir = data_dir()?.join("saved_objs");
 
     if !saved_objs_dir.exists() {
         return Err(anyhow::anyhow!("{}", error_string(&format!("Saved objects directory does not exist: {}", saved_objs_dir.display().to_string().bold()))));
@@ -226,12 +219,7 @@ pub async fn clear_cache(days: u64) -> Result<(), anyhow::Error> {
 }
 
 pub async fn clear_all_cache() -> Result<(), anyhow::Error> {
-    let home_dir = dirs::home_dir().ok_or_else(|| {
-        anyhow::anyhow!("Could not find home directory")
-    })?;
-    
-    let archerdndsys_dir = home_dir.join(".archerdndsys");
-    let saved_objs_dir = archerdndsys_dir.join("saved_objs");
+    let saved_objs_dir = data_dir()?.join("saved_objs");
     
     if !saved_objs_dir.exists() {
         return Err(anyhow::anyhow!("{}", error_string(&format!("Saved objects directory does not exist: {}", saved_objs_dir.display().to_string().bold()))));
@@ -262,10 +250,7 @@ pub async fn clear_all_cache() -> Result<(), anyhow::Error> {
 }
 
 pub async fn load_auth_tokens() -> Result<(String, String), anyhow::Error> {
-    let home_dir = dirs::home_dir().ok_or_else(|| {
-        anyhow::anyhow!("Could not find home directory")
-    })?;
-    let auth_tokens_path = home_dir.join(".archerdndsys/.auth_tokens.txt");
+    let auth_tokens_path = data_dir()?.join(".auth_tokens.txt");
 
 
     if !auth_tokens_path.exists() {
@@ -286,7 +271,7 @@ pub async fn load_auth_tokens() -> Result<(String, String), anyhow::Error> {
     Ok((access_token, refresh_token))
 }
 
-pub async fn process_call(call: Vec<String>, client: Arc<Client>, authTokens: (String, String)) -> Result<(), anyhow::Error> {
+pub async fn process_call(call: Vec<String>, client: Arc<ApiClient>, authTokens: (String, String)) -> Result<(), anyhow::Error> {
     if call.len() < 2 {
         return Err(anyhow::anyhow!("{}", error_string(&format!("Invalid session call format: {:?}", call))));
     }
@@ -297,45 +282,87 @@ pub async fn process_call(call: Vec<String>, client: Arc<Client>, authTokens: (S
     match method.as_str() {
         "POST" => {
             let data = call.get(2).cloned().unwrap_or_default();
-            let response = client.post(&endpoint)
-                .bearer_auth(&authTokens.0)
-                .json(&data)
-                .send()
-                .await?;
+            let response = client.send_json_with_retry(reqwest::Method::POST, &endpoint, Some(&authTokens.0), Some(&data)).await?;
             if response.status().is_success() {
                 println!("{}", debug_string(&format!("POST request to {} succeeded.", endpoint.bold())));
             } else {
-                println!("{}", error_string(&format!("POST request to {} failed with status: {}", endpoint.bold(), response.status())));
+                println!("{}", error_string(&format!("POST request to {} failed with status: {}", endpoint.clone().bold(), response.status())));
+                return Err(anyhow::anyhow!("POST request to {} failed with status {}", endpoint, response.status()));
             }
         },
         "PUT" => {
             let data = call.get(2).cloned().unwrap_or_default();
-            let response = client.put(&endpoint)
-                .bearer_auth(&authTokens.0)
-                .json(&data)
-                .send()
-                .await?;
+            let response = client.send_json_with_retry(reqwest::Method::PUT, &endpoint, Some(&authTokens.0), Some(&data)).await?;
             if response.status().is_success() {
                 println!("{}", debug_string(&format!("PUT request to {} succeeded.", endpoint)));
             } else {
                 println!("{}", error_string(&format!("PUT request to {} failed with status: {}", endpoint, response.status())));
+                return Err(anyhow::anyhow!("PUT request to {} failed with status {}", endpoint, response.status()));
             }
         },
         "DELETE" => {
-            let response = client.delete(&endpoint)
-                .bearer_auth(&authTokens.0)
-                .send()
-                .await?;
+            let response = client.send_json_with_retry(reqwest::Method::DELETE, &endpoint, Some(&authTokens.0), None).await?;
             if response.status().is_success() {
                 println!("{}", debug_string(&format!("DELETE request to {} succeeded.", endpoint)));
             } else {
                 println!("{}", error_string(&format!("DELETE request to {} failed with status: {}", endpoint, response.status())));
+                return Err(anyhow::anyhow!("DELETE request to {} failed with status {}", endpoint, response.status()));
             }
         },
         _ => return Err(anyhow::anyhow!("{}", error_string(&format!("Unsupported HTTP method: {}", method))))
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clean_session_calls, parse_line};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_line_preserves_json_spaces() {
+        let parsed = parse_line(r#"POST /api/character {"name":"a b","level":1}"#).unwrap();
+        assert_eq!(parsed.0, "POST");
+        assert_eq!(parsed.1, "/api/character");
+        assert_eq!(parsed.2.as_deref(), Some(r#"{"name":"a b","level":1}"#));
+    }
+
+    #[test]
+    fn clean_session_calls_keeps_only_the_latest_update() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("session_calls.txt");
+        fs::write(
+            &path,
+            "PUT /api/character/one {\"name\":\"first\"}\nPUT /api/character/one {\"name\":\"last\"}\n",
+        )
+        .unwrap();
+
+        clean_session_calls(path.clone()).unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("last"));
+        assert!(!contents.contains("first"));
+    }
+
+    #[test]
+    fn clean_session_calls_collapses_prior_operations_to_delete() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("session_calls.txt");
+        fs::write(
+            &path,
+            "POST /api/character/one {\"name\":\"new\"}\nPUT /api/character/one {\"name\":\"changed\"}\nDELETE /api/character/one\n",
+        )
+        .unwrap();
+
+        clean_session_calls(path.clone()).unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.starts_with("DELETE /api/character/one"));
+    }
 }
 
 // All Campaign Commands can be made directly to the server; rate limit to 30 per minute.

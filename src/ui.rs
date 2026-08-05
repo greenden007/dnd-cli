@@ -1,29 +1,30 @@
-use std::{io, fs, path::PathBuf, time::Duration, error::Error};
+use std::{io, fs, time::Duration, error::Error};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Tabs},
     Frame, Terminal,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::io::BufRead;
-use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
+use serde_json::Value;
 use std::time::Instant;
-use tui_input::{Input as TuiInput, InputRequest as TuiInputRequest};
+use dialoguer::Select;
+use tempfile::NamedTempFile;
+use chrono;
 
 use crate::{
-    check_setup_cmpl, debug_string, error_string, info_string, setup_string, trace_string, warning_string, SERVER,
+    check_setup_cmpl, debug_string, error_string, info_string, setup_string, trace_string, warning_string,
 };
+use crate::transport::ApiClient;
+use crate::cache::{load_manifest, save_manifest};
+use reqwest::Method;
 
 // UI State
 #[derive(Debug, Clone)]
@@ -171,7 +172,8 @@ pub async fn run_ui() -> Result<(), Box<dyn Error>> {
         app.character = Some(character);
     }
 
-    // Main event loop
+    // Main event loop. Keep terminal restoration outside the event loop so an
+    // input/draw error cannot leave the user's shell in raw mode.
     let res = run_app(&mut terminal, &mut app);
 
     // Restore terminal
@@ -183,15 +185,11 @@ pub async fn run_ui() -> Result<(), Box<dyn Error>> {
     )?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("Error: {}", err);
-    }
-
-    Ok(())
+    res.map_err(|err| -> Box<dyn Error> { Box::new(err) })
 }
 
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut AppState,
 ) -> io::Result<()> {
     let tick_rate = Duration::from_millis(200);
@@ -255,8 +253,8 @@ fn run_app<B: Backend>(
     }
 }
 
-fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
-    let size = f.size();
+fn ui(f: &mut Frame, app: &AppState) {
+    let size = f.area();
     
     // Split the layout
     let chunks = Layout::default()
@@ -278,15 +276,15 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
         Some(character) => format!("{} - Level {} {}", 
             character.name, 
             character.level,
-            character.classes.first().map_or("Adventurer".to_string(), |c| c.class.clone())
+            character.classes.first().map(|c| c.class.as_str()).unwrap_or("Adventurer")
         ),
         None => "D&D Character Manager".to_string(),
     };
-    
-    let header = Paragraph::new(title)
+
+    let title = Paragraph::new(Line::from(title))
         .style(Style::default().add_modifier(Modifier::BOLD))
         .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(header, chunks[0]);
+    f.render_widget(title, chunks[0]);
 
     // Main content
     match app.current_tab {
@@ -300,7 +298,8 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     }
 
     // Tabs
-    let tabs = Tabs::new(TABS.iter().map(|t| Spans::from(*t)))
+    const TABS: &[&str] = &["Character", "Abilities", "Skills", "Inventory", "Spells", "Features"];
+    let tabs = Tabs::new(TABS.iter().map(|t| Line::from(*t)))
         .select(app.current_tab)
         .style(Style::default().fg(Color::White))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
@@ -309,12 +308,12 @@ fn ui<B: Backend>(f: &mut Frame<B>, app: &AppState) {
     f.render_widget(tabs, chunks[2]);
 
     // Status bar
-    let status = Paragraph::new(app.status_message.clone())
+    let status = Paragraph::new(Line::from(app.status_message.clone()))
         .style(Style::default().fg(Color::LightBlue));
     f.render_widget(status, chunks[3]);
 }
 
-fn draw_character_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) {
+fn draw_character_tab(f: &mut Frame, app: &AppState, area: Rect) {
     if let Some(character) = &app.character {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -327,25 +326,24 @@ fn draw_character_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) 
             .borders(Borders::ALL);
         
         let mut info_text = vec![
-            Spans::from(format!("Name: {}", character.name)),
-            Spans::from(format!("Race: {}", character.race.as_deref().unwrap_or("Unknown"))),
-            Spans::from(format!(
+            Line::from(format!("Name: {}", character.name)),
+            Line::from(format!("Race: {}", character.race.as_deref().unwrap_or("Unknown"))),
+            Line::from(format!(
                 "Class: {}",
                 character.classes.iter()
                     .map(|c| format!("{} {}", c.level, c.class))
                     .collect::<Vec<_>>()
                     .join(" / ")
             )),
-            Spans::from(format!("Background: {}", character.background.as_deref().unwrap_or("None"))),
-            Spans::from(format!("Alignment: {}", character.alignment)),
-        ];
+            Line::from(format!("Background: {}", character.background.as_deref().unwrap_or("None"))),
+            Line::from(format!("Alignment: {}", character.alignment)),
+            Line::from(""),
+            Line::from("Hit Points"),
+            Line::from(format!("  Current: {}", character.hit_points.current)),
+            Line::from(format!("  Maximum: {}", character.hit_points.maximum)),
+            Line::from(format!("  Temporary: {}", character.hit_points.temporary))
         
-        // Add HP
-        info_text.push(Spans::from(""));
-        info_text.push(Spans::from("Hit Points"));
-        info_text.push(Spans::from(format!("  Current: {}", character.hit_points.current)));
-        info_text.push(Spans::from(format!("  Maximum: {}", character.hit_points.maximum)));
-        info_text.push(Spans::from(format!("  Temporary: {}", character.hit_points.temporary)));
+        ];
         
         let info_paragraph = Paragraph::new(info_text).block(info_block);
         f.render_widget(info_paragraph, chunks[0]);
@@ -356,8 +354,8 @@ fn draw_character_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) 
             .borders(Borders::ALL);
             
         let stats_text = vec![
-            Spans::from("Press 'n' to increase HP, 'p' to decrease"),
-            Spans::from(""),
+            Line::from("Press 'n' to increase HP, 'p' to decrease"),
+            Line::from(""),
         ];
         
         let stats_paragraph = Paragraph::new(stats_text).block(stats_block);
@@ -368,8 +366,8 @@ fn draw_character_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) 
             .borders(Borders::ALL);
         
         let text = vec![
-            Spans::from("No character is currently loaded."),
-            Spans::from("Create a new character or load an existing one."),
+            Line::from("No character is currently loaded."),
+            Line::from("Create a new character or load an existing one."),
         ];
         
         let paragraph = Paragraph::new(text)
@@ -379,7 +377,7 @@ fn draw_character_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) 
     }
 }
 
-fn draw_abilities_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) {
+fn draw_abilities_tab(f: &mut Frame, app: &AppState, area: Rect) {
     if let Some(character) = &app.character {
         let ability_scores = [
             ("Strength", character.abilities.strength),
@@ -394,96 +392,88 @@ fn draw_abilities_tab<B: Backend>(f: &mut Frame<B>, app: &AppState, area: Rect) 
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(1),
-                    Constraint::Min(1),
+                    Constraint::Length(3),
+                    Constraint::Min(0),
                 ]
                 .as_ref(),
             )
             .split(area);
 
-        // Title
-        let title = Paragraph::new("Ability Scores")
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .alignment(ratatui::layout::Alignment::Center);
-        f.render_widget(title, chunks[0]);
-
-        // Abilities grid
+        // Draw ability scores in a grid (2 columns)
         let ability_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(
                 [
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(50),
                 ]
                 .as_ref(),
             )
             .split(chunks[1]);
 
-        for (i, (name, score)) in ability_scores.chunks(2).enumerate() {
-            if i < ability_chunks.len() {
-                let ability_block = Block::default()
-                    .borders(Borders::ALL);
-                
-                let mut ability_text = Vec::new();
-                
-                for (ability_name, score) in score.iter() {
-                    let modifier = (score - 10) / 2;
-                    ability_text.push(Spans::from(Span::styled(
-                        format!("{}: {} ({}{})", 
-                            ability_name, 
-                            score,
-                            if modifier >= 0 { "+" } else { "" },
-                            modifier
-                        ),
-                        Style::default(),
-                    )));
+        // Draw ability scores in two columns
+        for col in 0..2 {
+            let ability_block = Block::default()
+                .borders(Borders::ALL)
+                .title(if col == 0 { "Abilities" } else { " " });
+            
+            let mut ability_text = Vec::new();
+            for row in 0..3 {
+                let idx = row * 2 + col;
+                if idx >= ability_scores.len() {
+                    break;
                 }
-                
-                let ability_paragraph = Paragraph::new(ability_text).block(ability_block);
-                f.render_widget(ability_paragraph, ability_chunks[i]);
+                let (name, score) = ability_scores[idx];
+                let modifier = (score as i16 - 10) / 2;
+                ability_text.push(Line::from(
+                format!("{}: {} ({}{})", 
+                    name, 
+                    score,
+                    if modifier >= 0 { "+" } else { "" },
+                    modifier
+                )
+            ));
             }
+                
+            let ability_paragraph = Paragraph::new(ability_text).block(ability_block);
+            f.render_widget(ability_paragraph, ability_chunks[col]);
         }
     }
 }
 
 // Stub functions for other tabs
-fn draw_skills_tab<B: Backend>(f: &mut Frame<B>, _app: &AppState, area: Rect) {
+fn draw_skills_tab(f: &mut Frame, _app: &AppState, area: Rect) {
     let block = Block::default()
         .title("Skills")
         .borders(Borders::ALL);
-    
-    let text = vec![Spans::from("Skills tab content")];
+    let text = vec![Line::from("Skills tab content")];
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
 }
 
-fn draw_inventory_tab<B: Backend>(f: &mut Frame<B>, _app: &AppState, area: Rect) {
+fn draw_inventory_tab(f: &mut Frame, _app: &AppState, area: Rect) {
     let block = Block::default()
         .title("Inventory")
         .borders(Borders::ALL);
-    
-    let text = vec![Spans::from("Inventory tab content")];
+    let text = vec![Line::from("Inventory tab content")];
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
 }
 
-fn draw_spells_tab<B: Backend>(f: &mut Frame<B>, _app: &AppState, area: Rect) {
+fn draw_spells_tab(f: &mut Frame, _app: &AppState, area: Rect) {
     let block = Block::default()
         .title("Spells")
         .borders(Borders::ALL);
-    
-    let text = vec![Spans::from("Spells tab content")];
+    let text = vec![Line::from("Spells tab content")];
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
 }
 
-fn draw_features_tab<B: Backend>(f: &mut Frame<B>, _app: &AppState, area: Rect) {
+fn draw_features_tab(f: &mut Frame, _app: &AppState, area: Rect) {
     let block = Block::default()
         .title("Features & Traits")
         .borders(Borders::ALL);
-    
-    let text = vec![Spans::from("Features tab content")];
+    let text = vec![Line::from("Features tab content")];
     let paragraph = Paragraph::new(text).block(block);
     f.render_widget(paragraph, area);
 }
@@ -521,7 +511,7 @@ fn load_character() -> Result<Character, Box<dyn Error>> {
     })
 }
 
-async fn create_object(object_type: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub async fn create_object(object_type: Option<&str>) -> Result<(), Box<dyn Error>> {
     // For now, we'll just create a default character since we're focusing on the TUI
     let character = Character {
         name: "New Character".to_string(),
@@ -551,9 +541,7 @@ async fn create_object(object_type: Option<&str>) -> Result<(), Box<dyn Error>> 
     };
 
     // Save the character
-    let save_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-        .join(".archerdndsys")
+    let save_path = crate::config::data_dir()?
         .join("saved_objs")
         .join("character.json");
     
@@ -563,7 +551,7 @@ async fn create_object(object_type: Option<&str>) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-async fn edit_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub async fn edit_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let object_type = match object_type {
         Some(t) => t,
         None => {
@@ -593,10 +581,7 @@ async fn edit_object(object_type: Option<&str>, object_id: Option<&str>) -> Resu
     };
 
     // Open the object in the default editor
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let file_path = home_dir
-        .join(".archerdndsys")
+    let file_path = crate::config::data_dir()?
         .join("saved_objs")
         .join(object_type.to_lowercase())
         .join(format!("{}.json", object_id));
@@ -633,7 +618,7 @@ async fn edit_object(object_type: Option<&str>, object_id: Option<&str>) -> Resu
     Ok(())
 }
 
-async fn delete_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub async fn delete_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let object_type = match object_type {
         Some(t) => t,
         None => {
@@ -669,10 +654,7 @@ async fn delete_object(object_type: Option<&str>, object_id: Option<&str>) -> Re
     }
 
     // Delete the file
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let file_path = home_dir
-        .join(".archerdndsys")
+    let file_path = crate::config::data_dir()?
         .join("saved_objs")
         .join(object_type.to_lowercase())
         .join(format!("{}.json", object_id));
@@ -687,7 +669,7 @@ async fn delete_object(object_type: Option<&str>, object_id: Option<&str>) -> Re
     Ok(())
 }
 
-async fn list_objects(filter: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub async fn list_objects(filter: Option<&str>) -> Result<(), Box<dyn Error>> {
     let object_type = match filter {
         Some(t) if OBJECT_TYPES.contains(&t) => t,
         _ => {
@@ -707,7 +689,7 @@ async fn list_objects(filter: Option<&str>) -> Result<(), Box<dyn Error>> {
 
     println!("\n{} {}", info_string("✓"), object_type);
     println!("{}", "-".repeat(50));
-    for obj in objects {
+    for obj in &objects {
         println!("- {}", obj);
     }
     println!("\nTotal: {}\n", objects.len());
@@ -715,19 +697,16 @@ async fn list_objects(filter: Option<&str>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn sync_objects() -> Result<(), Box<dyn Error>> {
+pub async fn sync_objects() -> Result<(), Box<dyn Error>> {
     // Check if user is logged in
-    let token_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-        .join(".archerdndsys")
-        .join("token.txt");
+    let token_path = crate::config::data_dir()?.join(".auth_tokens.txt");
     
     if !token_path.exists() {
         return Err(anyhow::anyhow!("Not logged in. Please log in first.").into());
     }
 
     // Get the user ID
-    let user_id = std::fs::read_to_string(token_path)?.trim().to_string();
+    let _user_id = std::fs::read_to_string(&token_path)?.lines().nth(2).unwrap_or_default().to_string();
     
     // Sync each object type
     for &object_type in OBJECT_TYPES {
@@ -748,11 +727,9 @@ async fn sync_objects() -> Result<(), Box<dyn Error>> {
     }
 
     // Update sync timestamp
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let sync_file = home_dir.join(".archerdndsys").join("synced.txt");
+    let sync_file = crate::config::data_dir()?.join("synced.txt");
     let now = chrono::Utc::now().to_rfc3339();
-    std::fs::write(sync_file, now)?;
+    std::fs::write(sync_file, &now)?;
 
     println!("\n{} Sync completed at {}\n", info_string("✓"), now);
     Ok(())
@@ -760,10 +737,7 @@ async fn sync_objects() -> Result<(), Box<dyn Error>> {
 
 // Helper function to list objects of a specific type from the cache
 fn list_objects_in_cache(object_type: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let dir_path = home_dir
-        .join(".archerdndsys")
+    let dir_path = crate::config::data_dir()?
         .join("saved_objs")
         .join(object_type.to_lowercase());
 
@@ -786,7 +760,7 @@ fn list_objects_in_cache(object_type: &str) -> Result<Vec<String>, Box<dyn Error
     Ok(objects)
 }
 
-async fn get_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub async fn get_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let object_type = match object_type {
         Some(t) => t,
         None => {
@@ -813,28 +787,23 @@ async fn get_object(object_type: Option<&str>, object_id: Option<&str>) -> Resul
     }
 
     // Check if already exists locally
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let local_path = home_dir
-        .join(".archerdndsys")
+    let local_path = crate::config::data_dir()?
         .join("saved_objs")
         .join(object_type.to_lowercase())
         .join(format!("{}.json", object_id));
 
     if local_path.exists() {
-        println!("{} already exists locally. Use 'view' to see it or 'edit' to modify it.", object_id);
-        return Ok(());
+        println!("Checking local {} {} cache for this session...", object_type, object_id);
+    } else {
+        println!("Fetching {} {} from server...", object_type, object_id);
     }
-
-    // Fetch from server
-    println!("Fetching {} {} from server...", object_type, object_id);
-    ready_resource(object_id, object_type.to_string()).await?;
+    ready_resource(object_id.clone(), object_type.to_string()).await?;
     
     println!("{} Successfully fetched {} {}", info_string("✓"), object_type, object_id);
     Ok(())
 }
 
-async fn view_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
+pub async fn view_object(object_type: Option<&str>, object_id: Option<&str>) -> Result<(), Box<dyn Error>> {
     let object_type = match object_type {
         Some(t) => t,
         None => {
@@ -863,10 +832,7 @@ async fn view_object(object_type: Option<&str>, object_id: Option<&str>) -> Resu
     };
 
     // Read and display the object
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let file_path = home_dir
-        .join(".archerdndsys")
+    let file_path = crate::config::data_dir()?
         .join("saved_objs")
         .join(object_type.to_lowercase())
         .join(format!("{}.json", object_id));
@@ -891,10 +857,7 @@ fn show_help() {
 }
 
 async fn load_cache() -> Result<(Vec<String>), anyhow::Error> {
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let archerdndsys_dir = home_dir.join(".archerdndsys");
-    let saved_objs_dir = archerdndsys_dir.join("saved_objs");
+    let saved_objs_dir = crate::config::data_dir()?.join("saved_objs");
 
     if !saved_objs_dir.exists() {
         std::fs::create_dir_all(&saved_objs_dir)?;
@@ -911,64 +874,54 @@ async fn ready_resource(resource_id: String, resource_type: String) -> Result<()
         return Err(anyhow::anyhow!("Resource ID or Type cannot be empty."));
     }
     
-    if search_cache(&resource_type, &resource_id)? {
-        // Check if the resource is "fresh" in the cache
-        let home_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-        let synced = home_dir.join(".archerdndsys").join("saved_objs").join("synced.txt");
-        // Read first line of synced.txt
-        let synced_file = std::fs::File::open(synced)?;
-        let reader = std::io::BufReader::new(synced_file);
-        let mut lines = reader.lines();
-        let first_line = lines.next().ok_or_else(|| anyhow::anyhow!("No lines found in synced.txt"))??;
-        let (auth_token, _) = crate::auth::read_auth_tokens()?;
+    let data_root = crate::config::data_dir()?;
+    let resource_type = resource_type.to_lowercase();
+    let cache_key = format!("{}/{}", resource_type, resource_id);
+    let session_id = crate::auth::current_client_session_id()?;
+    let mut manifest = load_manifest(&data_root)?;
 
-        if first_line == auth_token {
-            return Ok(());
-        }
-
-        else if first_line.is_empty() || auth_token.is_empty() {
-            println!("{}", warning_string("Authorization tokens are missing or invalid"));
-            return Err(anyhow::anyhow!("Synced file is empty or authorization tokens are invalid."));
-        }
+    if search_cache(&resource_type, &resource_id)?
+        && manifest.get(&cache_key).map(String::as_str) == Some(session_id.as_str())
+    {
+        return Ok(());
     }
 
-    // Make GET request to the server to fetch the resource
-    let client = reqwest::Client::new();
-    let url = format!("{}/{}/{}", SERVER, resource_type, resource_id);
-    let response = client.get(&url)
-        .header("Authorization", format!("Bearer {}", crate::auth::read_auth_tokens()?.0))
-        .send()
+    // Make a retry-aware GET request only once per resource in the active
+    // client session. The response is persisted before the manifest is
+    // updated, so an interrupted write cannot create a false cache hit.
+    let client = ApiClient::from_saved_profile()?;
+    let path = format!("/func/{}/{}", resource_type.to_lowercase(), resource_id);
+    let (access_token, _) = crate::auth::read_auth_tokens()?;
+    let response = client
+        .send_json_with_retry(Method::GET, &path, Some(&access_token), None)
         .await?;
-    
+
     if !response.status().is_success() {
         return Err(anyhow::anyhow!("Failed to fetch resource: {}", response.status()));
     }
-    
-    // retrieve the resource data
+
     let resource_data = response.text().await?;
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let res_dir = home_dir.join(".archerdndsys").join("saved_objs").join(&resource_type);
-    if !res_dir.exists() {
-        println!("{} {} {}", error_string(""), "Resource directory does not exist.", setup_string);
-    }
-    
-   Ok(())
+    let _: Value = serde_json::from_str(&resource_data)
+        .map_err(|error| anyhow::anyhow!("Server returned invalid JSON for cached resource: {error}"))?;
+    let res_dir = data_root.join("saved_objs").join(&resource_type);
+    fs::create_dir_all(&res_dir)?;
+    let final_path = res_dir.join(format!("{}.json", resource_id));
+    let temp_path = res_dir.join(format!(".{}.json.tmp", resource_id));
+    fs::write(&temp_path, resource_data)?;
+    fs::rename(&temp_path, &final_path)?;
+    manifest.insert(cache_key, session_id);
+    save_manifest(&data_root, &manifest)?;
+
+    Ok(())
 
 }
 
-fn search_cache(resource_type: &String, resource_id: &String) -> Result<bool, anyhow::Error> {
+fn search_cache(resource_type: &str, resource_id: &str) -> Result<bool, anyhow::Error> {
     if resource_type.is_empty() || resource_id.is_empty() {
         return Err(anyhow::anyhow!("Resource type or ID cannot be empty."));
     }
-    
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let archerdndsys_dir = home_dir.join(".archerdndsys");
-    let resource_path = archerdndsys_dir.join("saved_objs").join(resource_type).join(format!("{}.json", resource_id));
-    
+
+    let resource_path = crate::config::data_dir()?.join("saved_objs").join(resource_type.to_lowercase()).join(format!("{}.json", resource_id));
+
     Ok(resource_path.exists())
 }
-
-

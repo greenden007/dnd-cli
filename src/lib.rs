@@ -1,12 +1,16 @@
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::path::PathBuf;
 use crossterm::style::Stylize;
-use reqwest::Client;
 use tokio::sync::Semaphore;
+use crate::transport::ApiClient;
 
 pub mod auth;
 pub mod ui;
 pub mod client;
+pub mod config;
+pub mod transport;
+pub mod cache;
 
 pub static LOCAL_ID: u32 = 0; // This is a placeholder for local ID management, can be used to track unsynced items
 pub static mut CACHE: BinaryHeap<String> = BinaryHeap::new(); // This will be used to cache the local items
@@ -33,7 +37,6 @@ pub fn trace_string(msg: &str) -> String {
 
 pub const setup_string: &str = "Please run `archerdndsys setup` to initialize the client.";
 
-pub const SERVER: &str = "https://archerdnd.tech/api";
 pub const REQ_FILES: [&str; 18] = [
     "saved_objs/",
     ".auth_tokens.txt",
@@ -61,6 +64,7 @@ pub fn check_setup_cmpl() -> Result<(), clap::Error> {
         "Could not find home directory",
     ))?;
     let archerdndsys_dir = home_dir.join(".archerdndsys");
+    let data_root = config::data_dir().map_err(|e| clap::Error::raw(clap::error::ErrorKind::Io, e.to_string()))?;
 
     if !archerdndsys_dir.exists() {
         return Err(clap::Error::raw(
@@ -70,7 +74,7 @@ pub fn check_setup_cmpl() -> Result<(), clap::Error> {
     }
 
     for file in &REQ_FILES {
-        let file_path = archerdndsys_dir.join(file);
+        let file_path = data_root.join(file);
         if !file_path.exists() {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::Io,
@@ -96,19 +100,14 @@ pub fn check_setup_cmpl() -> Result<(), clap::Error> {
 pub async fn push_load() -> Result<(), anyhow::Error> {
     // First, clean all session calls
     for i in 11..REQ_FILES.len() {
-        let file_path = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-            .join(".archerdndsys")
-            .join(REQ_FILES[i]);
+        let file_path = config::data_dir()?.join(REQ_FILES[i]);
         client::clean_session_calls(file_path)?
     }
 
     // Preload authorization tokens
 
-    let auth_tokens_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-        .join(".archerdndsys")
-        .join(".auth_tokens.txt");
+    let data_root = config::data_dir()?;
+    let auth_tokens_path = data_root.join(".auth_tokens.txt");
     if !auth_tokens_path.exists() {
         return Err(anyhow::anyhow!("Authorization tokens file not found. Please run `archerdndsys --setup` to initialize the client."));
     }
@@ -129,14 +128,16 @@ pub async fn push_load() -> Result<(), anyhow::Error> {
     // Run as 6 threads with semaphore to limit concurrency
     // Each file is in the format [OPERATION] [SERVER_ENDPOINT] [RESOURCES] (json data)
 
-    let client = Arc::new(Client::new());
-    let semaphore = Arc::new(Semaphore::new(6));
+    let client = Arc::new(ApiClient::from_saved_profile()?);
+    let concurrency = std::env::var("ARCHERDNDSYS_SYNC_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::new();
-    for i in 0..REQ_FILES.len() {
-        let file_path = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-            .join(".archerdndsys")
-            .join(REQ_FILES[i]);
+    for i in 11..REQ_FILES.len() {
+        let file_path = data_root.join(REQ_FILES[i]);
 
         if file_path.exists() {
             let client_clone = Arc::clone(&client);
@@ -147,27 +148,58 @@ pub async fn push_load() -> Result<(), anyhow::Error> {
             tasks.push(tokio::spawn(async move {
                 let _permit = semaphore_clone.acquire().await.unwrap();
                 let file_path_str = file_path_clone.display().to_string();
-                match client::collect_session_calls(file_path_clone) {
-                    Ok(calls) => {
-                        for call in calls {
-                            if let Err(e) = client::process_call(call, Arc::clone(&client_clone), auth_tokens_clone.clone()).await {
-                                eprintln!("Error processing call from {}: {}", file_path_str, e);
-                            }
-                        }
-                    },
-                    Err(e) => eprintln!("Error reading session calls from {}: {}", file_path_str, e),
+                if let Err(e) = process_session_file(file_path_clone, client_clone, auth_tokens_clone).await {
+                    eprintln!("Error processing calls from {}: {}", file_path_str, e);
                 }
             }))
+        }
+    }
+
+    for task in tasks {
+        if let Err(error) = task.await {
+            eprintln!("Sync worker failed: {error}");
         }
     }
 
     Ok(())
 }
 
+async fn process_session_file(
+    file_path: PathBuf,
+    client: Arc<ApiClient>,
+    auth_tokens: (String, String),
+) -> Result<(), anyhow::Error> {
+    let mut remaining: Vec<String> = std::fs::read_to_string(&file_path)
+        ?.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    while !remaining.is_empty() {
+        let line = remaining[0].clone();
+        let (method, endpoint, data) = client::parse_line(&line)
+            .ok_or_else(|| anyhow::anyhow!("Invalid session call format: {line}"))?;
+        let mut call = vec![method, endpoint];
+        if let Some(data) = data { call.push(data); }
+
+        // Only acknowledge a queue entry after the server confirms success.
+        // Failed entries remain on disk for a later retry.
+        client::process_call(call, Arc::clone(&client), auth_tokens.clone()).await?;
+        remaining.remove(0);
+        let contents = if remaining.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", remaining.join("\n"))
+        };
+        std::fs::write(&file_path, contents)?;
+    }
+
+    Ok(())
+}
+
 pub unsafe fn ready_cache() -> Result<(), anyhow::Error> {
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let sync_file_path = home_dir.join(".archerdndsys").join("saved_objs").join("synced.txt");
+    let sync_file_path = config::data_dir()?.join("saved_objs").join("synced.txt");
     if !sync_file_path.exists() {
         return Err(anyhow::anyhow!("Synced file not found. Please run `archerdndsys --setup` to initialize the client."));
     }

@@ -1,12 +1,16 @@
 mod auth;
 mod ui;
 mod client;
+mod config;
+mod transport;
+mod cache;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use anyhow;
-use crossterm::event::read;
 use crossterm::style::Stylize;
-use archerdndsys::{push_load, check_setup_cmpl, REQ_FILES, SERVER, error_string, info_string, warning_string, debug_string, trace_string, ready_cache, setup_string};
+use archerdndsys::{push_load, check_setup_cmpl, REQ_FILES, error_string, info_string, ready_cache};
+pub use archerdndsys::{debug_string, setup_string, trace_string, warning_string};
+use archerdndsys::config::{data_dir, load_profile_store, save_named_profile, set_active_profile, ServerProfile};
 
 #[derive(Parser)]
 #[command(name = "archerdndsys", about = "A client for the Archer RPG System")]
@@ -14,7 +18,18 @@ use archerdndsys::{push_load, check_setup_cmpl, REQ_FILES, SERVER, error_string,
 #[command(author = "Lockie", long_about = "A client for the Archer RPG System. \n\nThis client allows you to manage your characters, campaigns, and other data for the Archer RPG System. It provides a command line interface to interact with the server and manage your data.\n\nWhen invoked with no flags, it will list all saved data the user has locally by filenames. \n\nTo get started, run `archerdndsys setup` to initialize the client.")]
 enum Cli {
     /// Setup the client with initial configuration
-    Setup,
+    Setup {
+        /// Base URL for the server API, for example https://example.com/api
+        #[arg(long)]
+        server: Option<String>,
+        /// Name of the server profile to activate
+        #[arg(long, default_value = "default")]
+        profile: String,
+    },
+
+    /// Manage configured server profiles
+    #[command(subcommand)]
+    Profile(ProfileCommand),
 
     /// Manually login to the client
     #[command(visible_alias = "l")]
@@ -32,9 +47,14 @@ enum Cli {
     #[command(visible_alias = "L")]
     Logout,
 
-    /// Run the TUI client with subcommands
-    #[command(subcommand)]
-    Run(RunCommands),
+    /// Run the client in the terminal UI or command-line interface
+    Run {
+        /// Select the interaction mode. `auto` uses TUI with no command and CLI with a command.
+        #[arg(long, value_enum, default_value_t = Interface::Auto)]
+        interface: Interface,
+        #[command(subcommand)]
+        command: Option<RunCommands>,
+    },
 
     /// Check if setup is complete
     #[command(visible_alias = "c")]
@@ -60,6 +80,20 @@ enum Cli {
     /// List all saved data the user has locally by filenames
     #[command(visible_alias = "ls")]
     ListLocal,
+
+    #[command(visible_alias = "i")]
+    InPersonEncounter,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum Interface {
+    /// Choose TUI for an interactive session and CLI for a supplied subcommand.
+    #[default]
+    Auto,
+    /// Run a single command and exit.
+    Cli,
+    /// Open the interactive terminal UI.
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -98,7 +132,29 @@ enum RunCommands {
     Push,
 }
 
-async fn client_init_startup() -> Result<(), clap::Error> {
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List configured server profiles
+    List,
+    /// Activate a configured server profile
+    Use { name: String },
+}
+
+async fn run_cli_command(command: RunCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        RunCommands::Make => ui::create_object(None).await?,
+        RunCommands::Edit => ui::edit_object(None, None).await?,
+        RunCommands::Delete => ui::delete_object(None, None).await?,
+        RunCommands::List => ui::list_objects(None).await?,
+        RunCommands::Sync => ui::sync_objects().await?,
+        RunCommands::Get => ui::get_object(None, None).await?,
+        RunCommands::View => ui::view_object(None, None).await?,
+        RunCommands::Push => push_load().await?,
+    }
+    Ok(())
+}
+
+async fn client_init_startup(server_url: Option<String>, profile_name: String) -> Result<(), clap::Error> {
 
     println!("{}", info_string("Initializing client..."));
 
@@ -121,8 +177,39 @@ async fn client_init_startup() -> Result<(), clap::Error> {
     println!("{}", info_string("Directory found."));
     println!("{}", info_string("Checking for required files..."));
 
+    let configured_url = match server_url {
+        Some(url) => url,
+        None => {
+            print!("Server API URL [https://archerdnd.tech/api]: ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).map_err(|e| clap::Error::raw(
+                clap::error::ErrorKind::Io,
+                format!("Failed to read server URL: {e}"),
+            ))?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() { "https://archerdnd.tech/api".to_string() } else { trimmed.to_string() }
+        }
+    };
+    let profile = ServerProfile::new(configured_url).map_err(|e| clap::Error::raw(
+        clap::error::ErrorKind::InvalidValue,
+        e.to_string(),
+    ))?;
+    save_named_profile(&profile_name, &profile, true).map_err(|e| clap::Error::raw(
+        clap::error::ErrorKind::Io,
+        format!("Failed to save server profile: {e}"),
+    ))?;
+    let data_root = data_dir().map_err(|e| clap::Error::raw(
+        clap::error::ErrorKind::Io,
+        format!("Failed to determine profile data directory: {e}"),
+    ))?;
+    std::fs::create_dir_all(&data_root).map_err(|e| clap::Error::raw(
+        clap::error::ErrorKind::Io,
+        format!("Failed to create profile data directory: {e}"),
+    ))?;
+    println!("{} Using server profile '{}' at {}", info_string("Server configured."), profile_name, profile.base_url);
+
     for file in &REQ_FILES {
-        let file_path = archerdndsys_dir.join(file);
+        let file_path = data_root.join(file);
         println!("{}", info_string(&format!("Checking for file: {}", file.bold())));
         if !file_path.exists() {
             println!("{}", info_string(&format!("File not found. Creating: {}", file.bold())));
@@ -142,6 +229,7 @@ async fn client_init_startup() -> Result<(), clap::Error> {
         }
     }
 
+
     println!("{}", info_string("Client initialization complete."));
     Ok(())
 }
@@ -151,14 +239,26 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Cli::parse();
 
     match args {
-        Cli::Setup => {
-            if let Err(e) = client_init_startup().await {
+        Cli::Setup { server, profile } => {
+            if let Err(e) = client_init_startup(server, profile).await {
                 println!("{}", error_string(&format!("Client setup failed: {}", e)));
                 return Ok(());
             } else {
                 println!("{}", info_string("Client setup complete."));
                 return Ok(());
             }
+        }
+        Cli::Profile(ProfileCommand::List) => {
+            let store = load_profile_store()?;
+            for (name, profile) in store.profiles {
+                let marker = if name == store.active { "*" } else { " " };
+                println!("{} {} -> {}", marker, name, profile.base_url);
+            }
+        }
+        Cli::Profile(ProfileCommand::Use { name }) => {
+            set_active_profile(&name)?;
+            std::fs::create_dir_all(data_dir()?)?;
+            println!("{} Active server profile: {}", info_string("Profile selected."), name);
         }
         Cli::CheckSetup => {
             if let Err(e) = check_setup_cmpl() {
@@ -214,22 +314,38 @@ async fn main() -> Result<(), anyhow::Error> {
                 return Ok(());
             }
         }
-        Cli::Run(subcmd) => unsafe {
+        Cli::Run { interface, command } => {
             if !check_setup_cmpl().is_ok() {
                 println!("{}", error_string("Setup is incomplete or absent. Please run `archerdndsys setup` to initialize the client."));
                 return Ok(());
             }
 
-            // Check if signed in
-            if !auth::is_signed_in().await {
-                println!("{}", error_string("You must be signed in to run the client."));
-                return Ok(());
+            let open_tui = match interface {
+                Interface::Tui => true,
+                Interface::Cli => false,
+                Interface::Auto => command.is_none(),
+            };
+
+            if open_tui {
+                if command.is_some() {
+                    println!("{}", error_string("The TUI interface does not accept a run subcommand."));
+                    return Ok(());
+                }
+                if !auth::is_signed_in().await {
+                    println!("{}", error_string("You must be signed in to run the client."));
+                    return Ok(());
+                }
+                unsafe { ready_cache()?; }
+                ui::run_ui().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            } else if let Some(command) = command {
+                if matches!(command, RunCommands::Sync | RunCommands::Push) && !auth::is_signed_in().await {
+                    println!("{}", error_string("You must be signed in to run this command."));
+                    return Ok(());
+                }
+                run_cli_command(command).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            } else {
+                println!("{}", error_string("The CLI interface requires a run subcommand, for example `run --interface cli list`."));
             }
-
-            ready_cache()?;
-
-            // TODO: Implement the TUI client
-            ui::run_ui().await?;
         }
         Cli::CacheSize => {
             // Calculate the total size of the cached objects
@@ -272,7 +388,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 "Could not find home directory",
             ))?;
 
-            let saved_objs_dir = home_dir.join(".archerdndsys/saved_objs");
+            let saved_objs_dir = data_dir()?.join("saved_objs");
             if saved_objs_dir.exists() {
                 println!("{}", info_string("Saved objects directory found."));
                 // List all files in saved_objs subdirectories (there should be no direct files in this directory)
@@ -314,7 +430,42 @@ async fn main() -> Result<(), anyhow::Error> {
 
             return Ok(());
         }
+        _ => {
+            println!("{}", error_string("Invalid command. Please run `archerdndsys --help` for usage information."));
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn run_without_command_defaults_to_auto_interface() {
+        let parsed = Cli::try_parse_from(["archerdndsys", "run"]).unwrap();
+        assert!(matches!(parsed, Cli::Run { interface: Interface::Auto, command: None }));
+    }
+
+    #[test]
+    fn run_command_is_available_through_cli_interface() {
+        let parsed = Cli::try_parse_from(["archerdndsys", "run", "--interface", "cli", "list"])
+            .unwrap();
+        assert!(matches!(
+            parsed,
+            Cli::Run {
+                interface: Interface::Cli,
+                command: Some(RunCommands::List)
+            }
+        ));
+    }
+
+    #[test]
+    fn tui_interface_can_be_selected_explicitly() {
+        let parsed = Cli::try_parse_from(["archerdndsys", "run", "--interface", "tui"])
+            .unwrap();
+        assert!(matches!(parsed, Cli::Run { interface: Interface::Tui, command: None }));
+    }
 }
